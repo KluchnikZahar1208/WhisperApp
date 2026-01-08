@@ -1,0 +1,44 @@
+services:
+  whisper-api:
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+    container_name: whisperapp-api
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - RabbitMqSettings__Host=rabbitmq
+      - AudioSettings__BaseDirectory=/app/data
+      - AudioSettings__SegmentDuration=120
+      - AudioSettings__SegmentOverlap=2
+    ports:
+      - "5000:8080"
+    volumes:
+      - shared-audio-data:/app/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+
+  whisper-worker:
+    build:
+      context: ./src
+      dockerfile: WhisperApp.Worker/Dockerfile
+    environment:
+      - RabbitMqSettings__Host=rabbitmq
+      - WHISPER_MODELS_PATH=/app/models
+      - WhisperSettings__Threads=4
+    volumes:
+      - shared-audio-data:/app/data
+      - ./src/models:/app/models
+    depends_on:
+      - rabbitmq
+       
+volumes:
+  shared-audio-data:
+    driver: local

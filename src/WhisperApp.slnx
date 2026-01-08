@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="WhisperApp.Api/WhisperApp.Api.csproj" />
+  <Project Path="WhisperApp.Application/WhisperApp.Application.csproj" />
+  <Project Path="WhisperApp.Worker/WhisperApp.Worker.csproj" />
+</Solution>
