@@ -12,6 +12,8 @@ WORKDIR /opt/whisper.cpp
 RUN cmake -B build -DWHISPER_SHARED=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON
 RUN cmake --build build -j$(nproc)
 
+# Скачиваем модель именно здесь, чтобы использовать кэш Docker
+RUN bash ./models/download-ggml-model.sh large-v3-turbo
 # ========================
 # 2. Сборка .NET Worker
 # ========================
@@ -40,8 +42,9 @@ COPY --from=dotnet-build /app/publish .
 
 # Настройка путей (как в вашем примере)
 ENV WHISPER_MODELS_PATH=/models
-RUN mkdir -p /models /app/temp_audio
+RUN mkdir -p /models /app/data
+COPY --from=whisper-build /opt/whisper.cpp/models/ggml-large-v3-turbo.bin /models/
 
-VOLUME ["/models", "/app/temp_audio"]
+VOLUME ["/models", "/app/data"]
 
 ENTRYPOINT ["dotnet", "WhisperApp.Worker.dll"]
