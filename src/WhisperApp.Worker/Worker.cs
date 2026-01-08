@@ -15,7 +15,7 @@ public class Worker : BackgroundService
     private IConnection? _connection;
     private IChannel? _channel;
 
-    public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath);
+    public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath, string Language);
     public record SegmentTranscribedEvent(Guid SessionId, int SectionIndex, int SectionsTotal, string Text);
 
     public Worker(ILogger<Worker> logger, IConfiguration configuration)
@@ -98,14 +98,15 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task<string> RunWhisperCliAsync(AudioSegmentMessage message, string language = "auto")
+    private async Task<string> RunWhisperCliAsync(AudioSegmentMessage message)
     {
         string filePath = message.FilePath;
         string modelPath = Path.Combine(_configuration["WHISPER_MODELS_PATH"] ?? "/models", "ggml-large-v3-turbo.bin");
+        string language = message.Language;
 
         int threads = _configuration.GetValue<int>("WhisperSettings:Threads", 4);
         
-        var args = $"-m \"{modelPath}\" -f \"{filePath}\" -l {language} -nt -t {threads} -bo 1 -bs 1 -nf -mc 128";
+        var args = $"-m \"{modelPath}\" -f \"{filePath}\" -l {language} -nt -t {threads} -bo 2 -bs 2";
 
         var startInfo = new ProcessStartInfo
         {

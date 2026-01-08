@@ -1,3 +1,4 @@
+using System.Runtime.Serialization;
 using System.Text;
 using System.Text.Json;
 using FFMpegCore;
@@ -19,12 +20,31 @@ namespace WhisperApp.Api.Controllers
         private readonly IConnection _rabbitConnection;
 
         //Models
-        public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath);
+        public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath, string Language);
         public record TranscriptionSegment(Guid SessionId, int SectionIndex, int SectionsTotal, string Text);
         public record UploadResponse(Guid SessionId, string Status);
         public record StatusResponse(Guid SessionId, string Status, ProgressInfo Progress, DateTime UpdatedAt);
         public record ProgressInfo(int Ready, int Total, double Percentage);
         public record AssembleResponse(Guid SessionId, bool IsComplete, int Count, int Total, string FullText);
+        public enum WhisperLanguage
+        {
+            [EnumMember(Value = "auto")]
+            Auto,
+            [EnumMember(Value = "ru")]
+            Russian,
+            [EnumMember(Value = "en")]
+            English,
+            [EnumMember(Value = "de")]
+            German,
+            [EnumMember(Value = "fr")]
+            French,
+            [EnumMember(Value = "es")]
+            Spanish,
+            [EnumMember(Value = "it")]
+            Italian,
+            [EnumMember(Value = "zh")]
+            Chinese
+        }
         ///
 
 
@@ -201,6 +221,7 @@ namespace WhisperApp.Api.Controllers
         /// Если в куках был старый ID, данные этой сессии будут удалены.
         /// </remarks>
         /// <param name="file">Аудиофайл для обработки.</param>
+        /// <param name="language">Выберите язык транскрибации из списка.</param>
         /// <response code="200">Файл успешно загружен, сегментация начата.</response>
         /// <response code="400">Файл не передан или имеет нулевой размер.</response>
         /// <response code="500">Внутренняя ошибка сервера или сбой FFmpeg.</response>
@@ -208,11 +229,23 @@ namespace WhisperApp.Api.Controllers
         [ProducesResponseType(typeof(UploadResponse), StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public async Task<IActionResult> UploadAudio(IFormFile? file)
+        public async Task<IActionResult> UploadAudio(
+            IFormFile? file, 
+            WhisperLanguage language = WhisperLanguage.Auto
+        )
         {
             if (file == null || file.Length == 0)
                 return BadRequest("Файл не передан или имеет нулкевой размер.");
             
+            // Превращаем Enum в строку-код для RabbitMQ (например, "ru")
+            string languageCode = language.ToString().ToLower(); 
+            // Если нужно именно значение из EnumMember ("auto"), можно использовать метод расширения или switch
+            languageCode = language switch {
+                WhisperLanguage.Auto => "auto",
+                WhisperLanguage.Russian => "ru",
+                WhisperLanguage.English => "en",
+                _ => language.ToString().ToLower().Substring(0, 2)
+            };
             string rootStorage = _configuration["AudioSettings:BaseDirectory"] ?? "/app/temp_audio";
             Guid sessionId = Guid.NewGuid();
             
@@ -231,7 +264,7 @@ namespace WhisperApp.Api.Controllers
                     await file.CopyToAsync(stream);
                 }
                 
-                await ProcessAndPublishSegments(sourceFilePath, segmentsDir, sessionId);
+                await ProcessAndPublishSegments(sourceFilePath, segmentsDir, sessionId, languageCode);
 
                 return Ok(new 
                 { 
@@ -245,7 +278,7 @@ namespace WhisperApp.Api.Controllers
                 return StatusCode(500, $"Internal server error: {ex.Message}");
             }
         }
-        private async Task ProcessAndPublishSegments(string inputPath, string outputFolder, Guid sessionId)
+        private async Task ProcessAndPublishSegments(string inputPath, string outputFolder, Guid sessionId, string language)
         {
             int segmentDuration = _configuration.GetValue<int>("AudioSettings:SegmentDuration", 240);
             int overlap = _configuration.GetValue<int>("AudioSettings:SegmentOverlap", 2);
@@ -297,7 +330,7 @@ namespace WhisperApp.Api.Controllers
                     Priority = priority
                 };
 
-                var message = new AudioSegmentMessage(sessionId, index, sectionsTotal, segmentPath);
+                var message = new AudioSegmentMessage(sessionId, index, sectionsTotal, segmentPath, language);
                 var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
 
                 await channel.BasicPublishAsync(
