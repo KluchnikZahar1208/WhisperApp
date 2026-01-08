@@ -15,7 +15,7 @@ public class Worker : BackgroundService
     private IConnection? _connection;
     private IChannel? _channel;
 
-    public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath, string Language);
+    public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath, string Language, double StartTime, double EndTime);     
     public record SegmentTranscribedEvent(Guid SessionId, int SectionIndex, int SectionsTotal, string Text);
 
     public Worker(ILogger<Worker> logger, IConfiguration configuration)
@@ -152,7 +152,9 @@ public class Worker : BackgroundService
                     SessionId = message.SessionId,
                     SectionIndex = message.SectionIndex + 1,
                     SectionsTotal = message.SectionsTotal,
-                    Text = transcribedText
+                    Text = transcribedText,
+                    StartTime = message.StartTime,
+                    EndTime = message.EndTime
                 };
 
                 var options = new JsonSerializerOptions

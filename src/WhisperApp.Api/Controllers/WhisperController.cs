@@ -20,12 +20,32 @@ namespace WhisperApp.Api.Controllers
         private readonly IConnection _rabbitConnection;
 
         //Models
-        public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath, string Language);
-        public record TranscriptionSegment(Guid SessionId, int SectionIndex, int SectionsTotal, string Text);
+        public record AudioSegmentMessage(Guid SessionId, int SectionIndex, int SectionsTotal, string FilePath, string Language, double StartTime, double EndTime);
+        public record TranscriptionSegment(
+            Guid SessionId, 
+            int SectionIndex, 
+            int SectionsTotal, 
+            string Text, // Оставляем для совместимости, если нужно
+            List<TranscriptionItem>? Phrases = null // Добавляем список фраз с таймингами
+        );
         public record UploadResponse(Guid SessionId, string Status);
         public record StatusResponse(Guid SessionId, string Status, ProgressInfo Progress, DateTime UpdatedAt);
         public record ProgressInfo(int Ready, int Total, double Percentage);
         public record AssembleResponse(Guid SessionId, bool IsComplete, int Count, int Total, string FullText);
+
+        public record TranscriptionResultResponse(
+            Guid SessionId,
+            bool IsComplete,
+            int Count,
+            int Total,
+            List<TranscriptionItem> Segments
+        );
+
+        public record TranscriptionItem(
+            double Start,
+            double End,
+            string Text
+        );
         public enum WhisperLanguage
         {
             [EnumMember(Value = "auto")]
@@ -58,7 +78,90 @@ namespace WhisperApp.Api.Controllers
             _rabbitConnection = connection;
             _logger = logger;
         }
+        
+        [HttpGet("transcription/{sessionId:guid}")]
+        public async Task<IActionResult> GetTranscriptionSegments(Guid sessionId)
+        {
+            string rootStorage = _configuration["AudioSettings:BaseDirectory"] ?? "/app/temp_audio";
+            string sessionDir = Path.Combine(rootStorage, sessionId.ToString());
+            string transcriptionsDir = Path.Combine(sessionDir, "transcriptions");
 
+            if (!Directory.Exists(transcriptionsDir))
+                return NotFound(new { Message = "Данные сессии не найдены." });
+
+            // Считаем количество аудио-файлов для определения общего прогресса
+            string segmentsDir = Path.Combine(sessionDir, "segments");
+            int totalSegments = Directory.Exists(segmentsDir) 
+                ? Directory.GetFiles(segmentsDir, "*.wav").Length 
+                : 0;
+            
+            var jsonFiles = Directory.GetFiles(transcriptionsDir, "*.json");
+            var allItems = new List<TranscriptionItem>();
+
+            var jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+
+            foreach (var file in jsonFiles)
+            {
+                try
+                {
+                    // Используем System.IO.File, чтобы избежать конфликта с ControllerBase.File
+                    var content = await System.IO.File.ReadAllTextAsync(file);
+                    var segmentData = JsonSerializer.Deserialize<TranscriptionSegmentData>(content, jsonOptions);
+
+                    if (segmentData != null)
+                    {
+                        // ЛОГИКА: если в JSON есть массив Phrases (детальные таймкоды) — берем их.
+                        // Если нет — берем всё поле Text как один большой айтем.
+                        if (segmentData.Phrases != null && segmentData.Phrases.Any())
+                        {
+                            allItems.AddRange(segmentData.Phrases);
+                        }
+                        else if (!string.IsNullOrWhiteSpace(segmentData.Text))
+                        {
+                            allItems.Add(new TranscriptionItem(
+                                segmentData.StartTime, 
+                                segmentData.EndTime, 
+                                segmentData.Text
+                            ));
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка при чтении сегмента из файла: {File}", file);
+                }
+            }
+
+            // Удаляем дубликаты (актуально при использовании overlap) и сортируем по времени начала
+            var resultSegments = allItems
+                .GroupBy(p => new { p.Start, p.Text })
+                .Select(g => g.First())
+                .OrderBy(p => p.Start)
+                .ToList();
+
+            return Ok(new TranscriptionResultResponse(
+                SessionId: sessionId,
+                IsComplete: jsonFiles.Length >= totalSegments && totalSegments > 0,
+                Count: jsonFiles.Length,
+                Total: totalSegments,
+                Segments: resultSegments
+            ));
+        }
+
+        #region Вспомогательные модели данных
+
+        // Эта модель должна в точности соответствовать вашему JSON на диске
+        public record TranscriptionSegmentData(
+            Guid SessionId,
+            int SectionIndex,
+            int SectionsTotal,
+            string Text,
+            double StartTime, // Начало из вашего JSON
+            double EndTime,   // Конец из вашего JSON
+            List<TranscriptionItem>? Phrases // На случай, если воркер начнет слать детали
+        );
+
+        #endregion
         /// <summary>
         /// Собирает все готовые текстовые сегменты в единую транскрипцию.
         /// </summary>
@@ -287,50 +390,47 @@ namespace WhisperApp.Api.Controllers
             var analysis = await FFProbe.AnalyseAsync(inputPath);
             double totalDuration = analysis.Duration.TotalSeconds;
 
-            int sectionsTotal = 0;
-            for (double s = 0; s < totalDuration; s += step)
-            {
-                sectionsTotal++;
-                if (s + segmentDuration >= totalDuration) break;
-            }
+            // Считаем общее количество секций заранее
+            int sectionsTotal = (int)Math.Ceiling(totalDuration / step);
 
             using var channel = await _rabbitConnection.CreateChannelAsync();
             
-            var args = new Dictionary<string, object>
-            {
-                { "x-max-priority", 100 }
-            };
-
-            await channel.QueueDeclareAsync(
-                queue: "audio_segments", 
-                durable: true, 
-                exclusive: false, 
-                autoDelete: false,
-                arguments: args);
+            var args = new Dictionary<string, object> { { "x-max-priority", 100 } };
+            await channel.QueueDeclareAsync("audio_segments", true, false, false, args);
             
             int index = 0;
             for (double start = 0; start < totalDuration; start += step)
             {
+                // Вычисляем реальный конец сегмента (чтобы не выйти за пределы файла)
+                double currentSegmentEnd = Math.Min(start + segmentDuration, totalDuration);
+                double actualDuration = currentSegmentEnd - start;
+
                 string segmentFileName = $"seg_{index:D3}.wav";
                 string segmentPath = Path.Combine(outputFolder, segmentFileName);
 
+                // Нарезка через FFmpeg
                 await FFMpegArguments
                     .FromFileInput(inputPath)
                     .OutputToFile(segmentPath, overwrite: true, options => options
                         .Seek(TimeSpan.FromSeconds(start))
-                        .WithCustomArgument($"-t {segmentDuration}")
+                        .WithCustomArgument($"-t {actualDuration}") // Используем вычисленную длительность
                         .WithCustomArgument("-acodec pcm_s16le -ar 16000 -ac 1"))
                     .ProcessAsynchronously();
 
                 byte priority = (byte)Math.Max(1, 100 - index);
+                var properties = new BasicProperties { Persistent = true, Priority = priority };
 
-                var properties = new BasicProperties
-                {
-                    Persistent = true,
-                    Priority = priority
-                };
+                // Включаем StartTime и EndTime в сообщение
+                var message = new AudioSegmentMessage(
+                    sessionId, 
+                    index, 
+                    sectionsTotal, 
+                    segmentPath, 
+                    language,
+                    Math.Round(start, 2), 
+                    Math.Round(currentSegmentEnd, 2)
+                );
 
-                var message = new AudioSegmentMessage(sessionId, index, sectionsTotal, segmentPath, language);
                 var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
 
                 await channel.BasicPublishAsync(
@@ -339,6 +439,9 @@ namespace WhisperApp.Api.Controllers
                     mandatory: true,
                     basicProperties: properties,
                     body: body);
+
+                _logger.LogInformation("Сегмент {Index} (с {Start} по {End} сек) отправлен в очередь", 
+                    index, message.StartTime, message.EndTime);
 
                 index++;
                 if (start + segmentDuration >= totalDuration) break;
